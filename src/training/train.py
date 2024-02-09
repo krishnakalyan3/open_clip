@@ -18,6 +18,7 @@ from open_clip import get_input_dtype, CLIP, CustomTextCLIP
 from .distributed import is_master
 from .zero_shot import zero_shot_eval
 from .precision import get_autocast
+from operator import itemgetter
 
 
 class AverageMeter(object):
@@ -72,7 +73,10 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
     data['train'].set_epoch(epoch)  # set epoch in process safe manner via sampler or shared_epoch
     dataloader = data['train'].dataloader
+    
     num_batches_per_epoch = dataloader.num_batches // args.accum_freq
+    # logging.info(f"dataloader.num_batches: {dataloader.num_batches} num_batches_per_epoch: {num_batches_per_epoch}")
+    dataloader.num_samples = num_batches_per_epoch
     sample_digits = math.ceil(math.log(dataloader.num_samples + 1, 10))
 
     if args.accum_freq > 1:
@@ -82,15 +86,25 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
     end = time.time()
+
+    # for i, batch in enumerate(dataloader):
+    #     logging.info(i)
+
     for i, batch in enumerate(dataloader):
         i_accum = i // args.accum_freq
         step = num_batches_per_epoch * epoch + i_accum
-
+        # logging.info(f"step: {step}, i_accum: {i_accum}, i: {i}")
         if not args.skip_scheduler:
             scheduler(step)
 
-        images, texts = batch
-        images = images.to(device=device, dtype=input_dtype, non_blocking=True)
+        if isinstance(batch, dict):
+            keys = ["waveform", "longer"]
+            images = {k:batch[k].to(device) for k in keys}
+            texts = batch['text']
+        else:
+            images, texts = batch
+            images = images.to(device=device, dtype=input_dtype, non_blocking=True)
+        
         texts = texts.to(device=device, non_blocking=True)
 
         data_time_m.update(time.time() - end)
@@ -99,6 +113,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
         if args.accum_freq == 1:
             with autocast():
                 model_out = model(images, texts)
+                
                 logit_scale = model_out["logit_scale"]
                 if args.distill:
                     with torch.no_grad():
@@ -108,6 +123,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
                 total_loss = sum(losses.values())
                 losses["loss"] = total_loss
+                images = images["waveform"]
 
             backward(total_loss, scaler)
         else:
@@ -273,23 +289,33 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
         all_image_features, all_text_features = [], []
         with torch.no_grad():
             for i, batch in enumerate(dataloader):
-                images, texts = batch
-                images = images.to(device=device, dtype=input_dtype, non_blocking=True)
+                if isinstance(batch, dict):
+                    keys = ["waveform", "longer"]
+                    images = {k:batch[k].to(device) for k in keys}
+                    texts = batch['text']
+                else:
+                    images, texts = batch
+                    images = images.to(device=device, dtype=input_dtype, non_blocking=True)
                 texts = texts.to(device=device, non_blocking=True)
 
                 with autocast():
                     model_out = model(images, texts)
-                    image_features = model_out["image_features"]
+                    image_features = model_out.get("image_features", None)
+                    if not image_features:
+                        image_features = model_out.get("audio_features")
+                        image_features = F.normalize(image_features, dim=-1)
+                        images = images["waveform"]
                     text_features = model_out["text_features"]
                     logit_scale = model_out["logit_scale"]
                     # features are accumulated in CPU tensors, otherwise GPU memory exhausted quickly
                     # however, system RAM is easily exceeded and compute time becomes problematic
                     all_image_features.append(image_features.cpu())
+                    text_features = F.normalize(text_features, dim=-1)
                     all_text_features.append(text_features.cpu())
                     logit_scale = logit_scale.mean()
                     logits_per_image = logit_scale * image_features @ text_features.t()
                     logits_per_text = logits_per_image.t()
-
+        
                     batch_size = images.shape[0]
                     labels = torch.arange(batch_size, device=device).long()
                     total_loss = (
@@ -310,7 +336,7 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
                         cumulative_gen_loss += gen_loss * batch_size
                         logging.info(
                             f"Generative Loss: {cumulative_gen_loss / num_samples:.6f}\t")
-
+            # all_text_features = F.normalize(all_text_features, dim=-1)
             val_metrics = get_clip_metrics(
                 image_features=torch.cat(all_image_features),
                 text_features=torch.cat(all_text_features),
@@ -382,3 +408,214 @@ def maybe_compute_generative_loss(model_out):
         token_logits = model_out["logits"]
         token_labels = model_out["labels"]
         return F.cross_entropy(token_logits.permute(0, 2, 1), token_labels)
+
+def evaluate_clotho_audiocaps(
+        model, data, epoch, args, autocast, device, tb_writer=None
+):
+    """
+    Adapted from https://github.com/XinhaoMei/audio-text_retrieval/blob/main/tools/utils.py.
+    1. for text-to-audio retrieval, do 5 times and average the results
+    2. for R@1, R@5, R@10 in audio-to-text retrieval, take the best rank among 5 text
+    3. for map@10 in audio-to-text retrieval:
+        3.1: sort the rank of 5 text
+        3.2: exclude the rank >=10 (0-index)
+        3.3: compute the map regarding the remaining ranks: np.mean(np.arange(1, len(ranks)+1) / ranks).
+        (3.3) That is, take the top ranks of 5 text that is < 10, and assign the descending number as ground truth.
+        (3.3) E.g.: the ground truth of first rank of the 5 text should be 1, the second rank should be 2, etc.
+    """
+    # TODO: (yusong) only support single GPU evaluation and only support non-mlp case for now.
+    dataloader = data["val"].dataloader
+    with torch.no_grad():
+        eval_info = {}
+        for i, batch in enumerate(dataloader):
+            # audios = batch  # contains mel_spec, wavform, and longer list
+            keys = ["waveform", "longer"]
+
+            audios = {k:batch[k].to(device) for k in keys}
+            # texts = batch['text']
+
+            # each item in the list has 5 texts
+            if not args.is_hf == "transformer":
+                from open_clip import tokenize
+                texts = [tokenize(t) for t in batch['full_text']]
+                texts = torch.cat(texts)
+            else:
+                from .data import tokenizer
+                texts = [tokenizer(t, tmodel=args.tmodel) for t in batch['full_text']]  # 5 texts for each audio
+                texts = {k: torch.cat([t[k] for t in texts]) for k in texts[0].keys()}  # 5 x batch
+
+            # audios = audios.to(device=device, non_blocking=True)
+            texts = texts.to(device)
+
+            # batch['__url__'] contains the path to the data tar this sample is from
+            # So, b.split("/")[-3:-1] will get you '<dataset_name>-<dataset-split>'
+            all_names = list(set(["-".join(b.split("/")[-3:-1]) for b in batch['__url__']]))
+            for name in all_names:
+                if name not in eval_info.keys():
+                    # we will not use mlp outputs even if args.clap_mlploss=True
+                    eval_info[name] = {
+                        "cumulative_loss": 0.0,
+                        "num_samples": 0,
+                        "all_audio_features": [],
+                        "all_text_features": []
+                    }
+            with autocast():
+                audio_features, _, _ = model(audios, None)
+                _, text_features, _ = model(None, texts)
+                # audio_features = F.normalize(audio_features, dim=-1)
+                # text_features = F.normalize(text_features, dim=-1)
+
+                all_names = list(set(["-".join(b.split("/")[-3:-1]) for b in batch['__url__']]))
+                for n in all_names:
+                    idx = np.where(
+                        np.array(
+                            ["-".join(b.split("/")[-3:-1]) for b in batch['__url__']]
+                        )
+                        == n
+                    )[0]
+                    eval_info[n]["all_audio_features"].append(
+                        audio_features.cpu().index_select(
+                            0, torch.tensor(idx).long()
+                        )
+                    )
+                    # (yusong) please double-check. This is for selecting 5 text features at once.
+                    # because idx is a list of indices in size of num_samples,
+                    # and text_features is a tensor of size (5*num_samples, dim)
+                    # so we need to select 5 consecutive indices at once for a single index in idx.
+                    eval_info[n]["all_text_features"].append(
+                        text_features.cpu().reshape([-1, 5, text_features.shape[1]]).index_select(
+                            0, torch.tensor(idx).long()
+                        ).reshape([-1, text_features.shape[1]])
+                    )
+
+        val_metrics_all = {}
+
+        for n in eval_info.keys():
+            _, _, logit_scale = model(None, None)
+            logit_scale = logit_scale.cpu()
+
+            audio_features = torch.cat(eval_info[n]["all_audio_features"], dim=0)
+            text_features = torch.cat(eval_info[n]["all_text_features"], dim=0)
+
+            logits_per_audio = (logit_scale * audio_features @ text_features.t()).detach().cpu()
+            logits_per_text = logits_per_audio.t().detach().cpu()
+
+            # logits_per_audio shape: [num_samples, num_samples*5]
+            # logits_per_text shape: [num_samples*5, num_samples]
+
+            logging.info(f"dataset {n}, logits_per_audio shape: {logits_per_audio.shape}, "
+                         f"logits_per_text shape: {logits_per_text.shape}")
+
+            metrics = {}
+            num_samples = audio_features.shape[0]
+            metrics[f"num_samples"] = num_samples
+
+            # (yusong) the following code is very important, please double-check:
+            # logits_per_audio.reshape(num_samples, num_samples, 5)[:, :, d]
+            # logits_per_text.reshape(num_samples, 5, num_samples)[:, d, :]
+            # Those two are retrieving one of the 5 text for each audio.
+            labels = torch.arange(audio_features.shape[0]).long()
+            audio_to_text_loss = [
+                F.cross_entropy(
+                    logits_per_audio.reshape(num_samples, num_samples, 5)[:, :, d], labels) for d in range(5)
+            ]
+            text_to_audio_loss = [
+                F.cross_entropy(
+                    logits_per_text.reshape(num_samples, 5, num_samples)[:, d, :], labels) for d in range(5)
+            ]
+            total_loss = (
+                                 np.mean(audio_to_text_loss) + np.mean(text_to_audio_loss)
+                         ) / 2
+
+            metrics[f"cumulative_loss"] = total_loss.item()
+
+            # text to audio: do 5 times
+            pred_text = []
+            for d in range(5):
+                logit = logits_per_text.reshape(num_samples, 5, num_samples)[:, d, :]
+                ground_truth = torch.arange(len(logit)).view(-1, 1)
+                ranking = torch.argsort(logit, descending=True)  # [num_samples, num_samples]
+                preds = torch.where(ranking == ground_truth)[1]
+                pred_text.append(preds.detach().cpu().numpy())
+            pred_text_concat = np.concatenate(pred_text, axis=0)  # [5*num_samples]
+            metrics[f"text_to_audio_mean_rank"] = pred_text_concat.mean() + 1
+            metrics[f"text_to_audio_median_rank"] = np.floor(np.median(pred_text_concat)) + 1
+            for k in [1, 5, 10]:
+                metrics[f"text_to_audio_R@{k}"] = np.mean(pred_text_concat < k)
+            # map@10
+            metrics[f"text_to_audio_mAP@10"] = np.mean(np.where(pred_text_concat < 10, 1 / (pred_text_concat + 1), 0.0))
+
+            # audio to text: take the best result
+            # for audio to text map 10, sort and assign descending ground truth.
+            # see https://github.com/XinhaoMei/audio-text_retrieval/blob/main/tools/utils.py#L103
+            # map@10
+            map_all = []
+            pred_audio_all = []
+            for d in range(num_samples):
+                # logits_per_audio: [num_samples, num_samples*5]
+                logit_single = logits_per_audio[d, :]  # [5*num_samples]
+                # Ground-truth index: [d*5, d*5+1, d*5+2, d*5+3, d*5+4]
+                ranking = torch.argsort(logit_single, descending=True)  # [5*num_samples]
+                # ranking: the index of first match, second match, ...
+                ground_truth = torch.arange(d * 5, d * 5 + 5)[None]
+                all_pred = torch.where(torch.stack([ranking] * 5) == ground_truth.view(-1, 1))[1]
+                min_pred = torch.min(all_pred)
+                pred_audio_all.append(min_pred.detach().cpu().numpy())
+                all_pred_filter = all_pred[all_pred < 10].detach().cpu().numpy()
+                # /5 because we have 5 text, so it means for the text rank >=10 we count as 0.
+                map_single = np.sum((np.arange(1, len(all_pred_filter) + 1) / (all_pred_filter + 1))) / 5
+                map_all.append(map_single)
+            metrics[f"audio_to_text_mAP@10"] = np.mean(map_all)
+            for k in [1, 5, 10]:
+                metrics[f"audio_to_text_R@{k}"] = np.mean(np.array(pred_audio_all) < k)
+
+            val_metrics_all[n] = {
+                n + "/" + k: v for k, v in metrics.items()
+            }
+    return val_metrics_all
+
+
+def calculate_selection_performance_clotho_audiocaps(val_metrics_per_dataset):
+    """
+    Calculate performance for Clotho+AudioCaps for model selection.
+    """
+    selection_performance_all = []
+    for n in val_metrics_per_dataset.keys():
+        selection_performance = (val_metrics_per_dataset[n][f"{n}/audio_to_text_mAP@10"] +
+                                 val_metrics_per_dataset[n][f"{n}/text_to_audio_mAP@10"]) / 2
+        selection_performance_all.append(selection_performance)
+    return np.mean(selection_performance_all)
+
+
+def select_top_metric_clotho_audiocaps(metrics, val_metrics_per_dataset, args):
+    # val_metrics_per_dataset: dict, key: dataset name, value: dict, key: metric name, value: metric value
+    # metrics: dict, key: metric name, value: metric value
+    # Hack: use args to save the top performance
+    if not hasattr(args, "top_selection_performance"):
+        selection_performance = calculate_selection_performance_clotho_audiocaps(val_metrics_per_dataset)
+        # TODO: write the if and else together
+        metric_update = {}
+        for n in val_metrics_per_dataset.keys():
+            for k in val_metrics_per_dataset[n].keys():
+                metric_update[k.split('/')[0] + '-top' + '/' + k.split('/')[1]] = val_metrics_per_dataset[n][k]
+        metric_update['top_selection_performance'] = selection_performance
+        metric_update['top-selection-epoch'] = metrics['epoch']
+        metrics.update(metric_update)
+        args.top_metric = metric_update
+        args.top_selection_performance = selection_performance
+    else:
+        selection_performance_new = calculate_selection_performance_clotho_audiocaps(val_metrics_per_dataset)
+        selection_performance_old = args.top_selection_performance
+        if selection_performance_new > selection_performance_old:
+            metric_update = {}
+            for n in val_metrics_per_dataset.keys():
+                for k in val_metrics_per_dataset[n].keys():
+                    metric_update[k.split('/')[0] + '-top' + '/' + k.split('/')[1]] = val_metrics_per_dataset[n][k]
+            metric_update['top_selection_performance'] = selection_performance_new
+            metric_update['top-selection-epoch'] = metrics['epoch']
+            metrics.update(metric_update)
+            args.top_metric = metric_update
+            args.top_selection_performance = selection_performance_new
+        else:
+            metrics.update(args.top_metric)
+    return metrics

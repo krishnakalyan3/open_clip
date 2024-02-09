@@ -60,10 +60,94 @@ def parse_args(args):
         help="Number of samples in dataset. Useful for webdataset if not available in info file.",
     )
     parser.add_argument(
+        "--pretrained-audio",
+        default="",
+        type=str,
+        help="Use a pretrained audio model weights for the audio encoder of CLAP",
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adamw",
+        help="can be AdamW or SGD",
+    )
+    parser.add_argument(
+        "--freeze-text",
+        default=False,
+        action="store_true",
+        help="if you need to freeze the text encoder, make this True",
+    )
+    parser.add_argument(
         "--dataset-type",
-        choices=["webdataset", "csv", "synthetic", "auto"],
+        choices=["webdataset", "csv", "synthetic", "auto", "webdataset-audio"],
         default="auto",
         help="Which type of dataset to process."
+    )
+    parser.add_argument(
+        "--full-train-dataset",
+        nargs="+",
+        default=None,
+        help="Which dataset will be trained with all the subsets. (train+test)",
+    )
+    parser.add_argument(
+        "--datasetnames",
+        nargs="+",
+        default=None,
+        help="If loading webdataset, spedify the dataset names to load. Can be some of these: Clotho, audioset, audiocaps, BBCSoundEffects",
+    )
+    parser.add_argument(
+        "--exclude-eval-dataset",
+        nargs="+",
+        default=None,
+        help="Which dataset will be excluded with evaluation",
+    )
+    parser.add_argument(
+        "--datasetinfos",
+        nargs="+",
+        default=None,
+        help="If loading webdataset, spedify the dataset types to load. Can be some of these: train, test, valid, unbalanced_train, balanced_train, eval",
+    )
+    parser.add_argument(
+        "--dataset-proportion",
+        type=float,
+        default=1.0,
+        help="How much proportion of dataset we want to train.",
+    )
+    parser.add_argument(
+        "--datasetpath",
+        type=str,
+        default="/mnt/audio_clip/webdataset_tar",
+        help="The path to the dataset",
+    )
+    parser.add_argument(
+        "--data-filling",
+        type=str,
+        default="pad",
+        help="type of data filling when the audio length is shorter than the max length."
+             "Can be one of the following: repeat, repeatpad, pad",
+    )
+    parser.add_argument(
+        "--data-truncating",
+        type=str,
+        default="rand_trunc",
+        help="type of data truncation when the audio length is longer than the max length."
+             "Can be one of the following: rand_trunc, fusion",
+    )
+    parser.add_argument(
+        "--class-label-path",
+        type=str,
+        default=None,
+        help="The path of the class label pickle or csv.",
+    )
+    parser.add_argument(
+        "--kappa", type=float, default=0,
+        help="the kappa in the weighted contrastive loss, default is to turn off the weighted contrastive loss"
+    )
+    parser.add_argument(
+        "--clap-mlploss",
+        default=False,
+        action="store_true",
+        help="Using MLP loss for CLAP model or not",
     )
     parser.add_argument(
         "--dataset-resampled",
