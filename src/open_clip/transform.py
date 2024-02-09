@@ -22,6 +22,7 @@ class PreprocessCfg:
     interpolation: str = 'bicubic'
     resize_mode: str = 'shortest'
     fill_color: int = 0
+    audio_cfg: int = None
 
     def __post_init__(self):
         assert self.mode in ('RGB',)
@@ -333,7 +334,7 @@ def image_transform(
         else:
             train_transform = [
                 RandomResizedCrop(
-                    image_size,
+                    image_size  ,
                     scale=aug_cfg_dict.pop('scale'),
                     interpolation=InterpolationMode.BICUBIC,
                 ),

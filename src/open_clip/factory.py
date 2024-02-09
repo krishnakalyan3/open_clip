@@ -11,9 +11,10 @@ import torch
 
 from .constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD
 from .model import CLIP, CustomTextCLIP, convert_weights_to_lp, convert_to_custom_text_state_dict,\
-    resize_pos_embed, get_cast_dtype, resize_text_pos_embed, set_model_preprocess_cfg
+    resize_pos_embed, get_cast_dtype, resize_text_pos_embed, set_model_preprocess_cfg, CLAP
 from .coca_model import CoCa
-from .loss import ClipLoss, DistillClipLoss, CoCaLoss, SigLipLoss
+from .cocoa_model import CoCOA
+from .loss import ClipLoss, DistillClipLoss, CoCaLoss, SigLipLoss, ClapLoss, CoCoaLoss
 from .openai import load_openai_model
 from .pretrained import is_pretrained_cfg, get_pretrained_cfg, download_pretrained,\
     list_pretrained_tags_by_model, download_pretrained_from_hf
@@ -45,6 +46,8 @@ def _rescan_model_configs():
         with open(cf, 'r') as f:
             model_cfg = json.load(f)
             if all(a in model_cfg for a in ('embed_dim', 'vision_cfg', 'text_cfg')):
+                _MODEL_CONFIGS[cf.stem] = model_cfg
+            if all(a in model_cfg for a in ('embed_dim', 'audio_cfg', 'text_cfg')):
                 _MODEL_CONFIGS[cf.stem] = model_cfg
 
     _MODEL_CONFIGS = {k: v for k, v in sorted(_MODEL_CONFIGS.items(), key=lambda x: _natural_key(x[0]))}
@@ -178,12 +181,21 @@ def create_model(
         cache_dir: Optional[str] = None,
         output_dict: Optional[bool] = None,
         require_pretrained: bool = False,
+        pretrained_audio: bool = False,
         **model_kwargs,
 ):
     force_preprocess_cfg = force_preprocess_cfg or {}
     preprocess_cfg = asdict(PreprocessCfg())
     has_hf_hub_prefix = model_name.startswith(HF_HUB_PREFIX)
-    if has_hf_hub_prefix:
+    cast_dtype = get_cast_dtype(precision)
+    
+    if model_name.startswith("HTSAT"):
+        model_cfg = get_model_config(model_name)
+        model = CLAP(**model_cfg, cast_dtype=cast_dtype)
+        setattr(model, "model_cfg", model_cfg)
+
+        # pretrained_audio = model_kwargs.pop("pretrained_audio", None)
+    elif has_hf_hub_prefix:
         model_id = model_name[len(HF_HUB_PREFIX):]
         checkpoint_path = download_pretrained_from_hf(model_id, cache_dir=cache_dir)
         config = _get_hf_config(model_id, cache_dir)
@@ -206,7 +218,7 @@ def create_model(
             device=device,
             cache_dir=cache_dir,
         )
-    else:
+    elif not model_name.startswith("HTSAT"):
         model_cfg = model_cfg or get_model_config(model_name)
         if model_cfg is not None:
             logging.info(f'Loaded {model_name} model config.')
@@ -235,7 +247,6 @@ def create_model(
                 assert False, 'pretrained image towers currently only supported for timm models'
 
         # cast_dtype set for fp16 and bf16 (manual mixed-precision), not set for 'amp' or 'pure' modes
-        cast_dtype = get_cast_dtype(precision)
         is_hf_model = 'hf_model_name' in model_cfg.get('text_cfg', {})
         if is_hf_model:
             # load pretrained weights for HF text model IFF no CLIP weights being loaded
@@ -243,13 +254,20 @@ def create_model(
         custom_text = model_cfg.pop('custom_text', False) or force_custom_text or is_hf_model
 
         model_cfg = dict(model_cfg, **model_kwargs)  # merge cfg dict w/ kwargs (kwargs overrides cfg)
+        
         if custom_text:
-            if "multimodal_cfg" in model_cfg:
-                model = CoCa(**model_cfg, cast_dtype=cast_dtype)
+            if "multimodal_cfg" in model_cfg and model_cfg.get("audio_cfg", None):
+                logging.info(model_cfg)
+                model = CoCOA(**model_cfg, cast_dtype=cast_dtype)
+                setattr(model, "model_cfg", model_cfg)
+            elif "multimodal_cfg" in model_cfg:
+                model = CoCa(**model_cfg, cast_dtype=cast_dtype)   
             else:
                 model = CustomTextCLIP(**model_cfg, cast_dtype=cast_dtype)
         else:
-            model = CLIP(**model_cfg, cast_dtype=cast_dtype)
+            if not model_name.startswith("HTSAT"):
+                model = CLIP(**model_cfg, cast_dtype=cast_dtype)
+
 
         if precision in ("fp16", "bf16"):
             dtype = torch.float16 if 'fp16' in precision else torch.bfloat16
@@ -272,10 +290,14 @@ def create_model(
         elif precision in ("pure_fp16", "pure_bf16"):
             dtype = torch.float16 if 'fp16' in precision else torch.bfloat16
             model.to(device=device, dtype=dtype)
+
         else:
             model.to(device=device)
 
+        model_cfg = dict(model_cfg, **model_kwargs) 
+
         pretrained_loaded = False
+
         if pretrained:
             checkpoint_path = ''
             pretrained_cfg = get_pretrained_cfg(model_name, pretrained)
@@ -295,6 +317,7 @@ def create_model(
                 logging.warning(error_str)
                 raise RuntimeError(error_str)
             pretrained_loaded = True
+
         elif has_hf_hub_prefix:
             logging.info(f'Loading pretrained {model_name} weights ({checkpoint_path}).')
             load_checkpoint(model, checkpoint_path)
@@ -305,6 +328,42 @@ def create_model(
             raise RuntimeError(
                 f'Pretrained weights were required for (model: {model_name}, pretrained: {pretrained}) but not loaded.')
 
+    if model_name.startswith("HTSAT") and not pretrained:
+        if pretrained_audio:
+            logging.info(pretrained_audio.split("/")[-1].startswith('HTSAT'))
+            if pretrained_audio.split("/")[-1].startswith('HTSAT'):
+                
+                if 'HTSAT_AudioSet_Saved' in pretrained_audio:
+                    audio_ckpt = torch.load(pretrained_audio, map_location='cpu')
+                    audio_ckpt = audio_ckpt['state_dict']
+                    keys = list(audio_ckpt.keys())
+                    for key in keys:
+                        if key.startswith('sed_model') and ('spectrogram_extractor' not in key
+                                                            and 'logmel_extractor' not in key):
+                            v = audio_ckpt.pop(key)
+                            audio_ckpt['audio.' + key[10:]] = v
+                else:
+                # elif os.path.basename(pretrained_audio).startswith('HTSAT'):  # checkpoint trained via HTSAT codebase
+                    audio_ckpt = torch.load(pretrained_audio, map_location='cpu')
+                    audio_ckpt = audio_ckpt['state_dict']
+                    keys = list(audio_ckpt.keys())
+                    for key in keys:
+                        if key.startswith('sed_model'):
+                            v = audio_ckpt.pop(key)
+                            audio_ckpt['audio.' + key[10:]] = v
+                # elif os.path.basename(pretrained_audio).startswith('finetuned'):  # checkpoint trained via linear probe codebase
+                #     audio_ckpt = torch.load(pretrained_audio, map_location='cpu')
+                # else:
+                #     raise ValueError('Unknown audio checkpoint')
+            else:
+                raise f'this audio encoder pretrained checkpoint is not support'
+
+        model.load_state_dict(audio_ckpt, strict=False)
+        logging.info(f"Loading pretrained {pretrained_audio.split('/')[-1]} weights ({pretrained_audio}).")
+        param_names = [n for n, p in model.named_parameters()]
+        for n in param_names:
+            print(n, "\t", "Loaded" if n in audio_ckpt else "Unloaded")
+
     if output_dict and hasattr(model, "output_dict"):
         model.output_dict = True
 
@@ -312,9 +371,9 @@ def create_model(
         model = torch.jit.script(model)
 
     # set image preprocessing configuration in model attributes for convenience
-    if getattr(model.visual, 'image_size', None) is not None:
+    if getattr(model.audio, 'image_size', None) is not None:
         # use image_size set on model creation (via config or force_image_size arg)
-        force_preprocess_cfg['size'] = model.visual.image_size
+        force_preprocess_cfg['size'] = model.audio.image_size
     set_model_preprocess_cfg(model, merge_preprocess_dict(preprocess_cfg, force_preprocess_cfg))
 
     return model
@@ -341,12 +400,33 @@ def create_loss(args):
             world_size=args.world_size,
             use_horovod=args.horovod,
         )
+    elif "cocoa" in args.model.lower():
+        return CoCoaLoss(
+            caption_loss_weight=args.coca_caption_loss_weight,
+            clip_loss_weight=args.coca_contrastive_loss_weight,
+            local_loss=args.local_loss,
+            gather_with_grad=args.gather_with_grad,
+            cache_labels=True,
+            rank=args.rank,
+            world_size=args.world_size,
+            use_horovod=args.horovod,
+        )
     elif args.siglip:
         assert not args.horovod, "Horovod not currently supported for SigLip"
         return SigLipLoss(
             rank=args.rank,
             world_size=args.world_size,
         )
+    elif args.audio:
+        return ClapLoss(
+            local_loss=args.local_loss,
+            gather_with_grad=args.gather_with_grad,
+            cache_labels=True,
+            rank=args.rank,
+            world_size=args.world_size,
+            use_horovod=args.horovod,
+            weight_loss_kappa=args.kappa,
+            )
     return ClipLoss(
         local_loss=args.local_loss,
         gather_with_grad=args.gather_with_grad,
@@ -376,11 +456,13 @@ def create_model_and_transforms(
         pretrained_hf: bool = True,
         cache_dir: Optional[str] = None,
         output_dict: Optional[bool] = None,
+        pretrained_audio: Optional[bool] = False,
         **model_kwargs,
 ):
     force_preprocess_cfg = merge_preprocess_kwargs(
         {}, mean=image_mean, std=image_std, interpolation=image_interpolation, resize_mode=image_resize_mode)
-
+    
+    logging.info("pretrained audio:")
     model = create_model(
         model_name,
         pretrained,
@@ -396,6 +478,7 @@ def create_model_and_transforms(
         pretrained_hf=pretrained_hf,
         cache_dir=cache_dir,
         output_dict=output_dict,
+        pretrained_audio=pretrained_audio,
         **model_kwargs,
     )
 

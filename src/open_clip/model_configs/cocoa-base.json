@@ -1,0 +1,37 @@
+{
+    "embed_dim": 1024,
+    "multimodal_cfg": {
+        "width": 512,
+        "context_length": 76,
+        "vocab_size": 64000,
+        "mlp_ratio": 4,
+        "layers": 12,
+        "dim_head": 64,
+        "heads": 8,
+        "n_queries": 256,
+        "attn_pooler_heads": 8
+    },
+    "audio_cfg": {
+        "audio_length": 1024,
+        "clip_samples": 480000,
+        "mel_bins": 64,
+        "sample_rate": 48000,
+        "window_size": 1024,
+        "hop_size": 480,
+        "fmin": 50,
+        "fmax": 14000,
+        "class_num": 527,
+        "model_type": "HTSAT",
+        "model_name": "base"
+    },
+    "text_cfg": {
+        "context_length": 76,
+        "vocab_size": 64000,
+        "layers": 12,
+        "heads": 8,
+        "width": 512,
+        "embed_cls": true,
+        "output_tokens": true
+    },
+    "custom_text": true
+}

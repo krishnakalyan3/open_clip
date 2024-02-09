@@ -21,6 +21,23 @@ from .timm_model import TimmModel
 from .transformer import LayerNormFp32, LayerNorm, QuickGELU, Attention, VisionTransformer, TextTransformer,\
     text_global_pool
 from .utils import to_2tuple
+from .htsat import create_htsat_model
+
+
+@dataclass
+class CLIPAudioCfg:
+    model_type: str = "HTSAT"
+    model_name: str = "tiny"
+    sample_rate: int = 48000
+    # Param
+    audio_length: int = 1024
+    window_size: int = 1024
+    hop_size: int = 1024
+    fmin: int = 50
+    fmax: int = 14000
+    class_num: int = 527
+    mel_bins: int = 64
+    clip_samples: int = 480000
 
 
 @dataclass
@@ -81,6 +98,7 @@ class CLIPTextCfg:
     hf_model_pretrained: bool = True
     hf_proj_type: str = 'mlp'
     hf_pooler_type: str = 'mean_pooler'  # attentional pooling for HF models
+    audio: bool = False
 
 
 def get_cast_dtype(precision: str):
@@ -100,6 +118,27 @@ def get_input_dtype(precision: str):
         input_dtype = torch.float16
     return input_dtype
 
+
+def _build_audio_tower(
+        embed_dim: int,
+        audio_cfg: CLIPAudioCfg,
+        quick_gelu: bool = False,
+        cast_dtype: Optional[torch.dtype] = None
+):
+    if isinstance(audio_cfg, dict):
+        audio_cfg = CLIPAudioCfg(**audio_cfg)
+
+    # OpenAI models are pretrained w/ QuickGELU but native nn.GELU is both faster and more
+    # memory efficient in recent PyTorch releases (>= 1.10).
+    # NOTE: timm models always use native GELU regardless of quick_gelu flag.
+    act_layer = QuickGELU if quick_gelu else nn.GELU
+
+    if audio_cfg.model_type == "HTSAT":
+        audio_tower = create_htsat_model(audio_cfg)
+    else:
+        raise f"Unknown model type: {audio_cfg.model_type}!"
+
+    return audio_tower
 
 def _build_vision_tower(
         embed_dim: int,
@@ -175,6 +214,7 @@ def _build_text_tower(
         text_cfg: CLIPTextCfg,
         quick_gelu: bool = False,
         cast_dtype: Optional[torch.dtype] = None,
+        audio: Optional[bool] = False
 ):
     if isinstance(text_cfg, dict):
         text_cfg = CLIPTextCfg(**text_cfg)
@@ -213,9 +253,141 @@ def _build_text_tower(
             output_tokens=text_cfg.output_tokens,
             act_layer=act_layer,
             norm_layer=norm_layer,
+            audio=audio
         )
     return text
 
+class CLAP(nn.Module):
+    output_dict: torch.jit.Final[bool]
+
+    def __init__(
+            self,
+            embed_dim: int,
+            audio_cfg: CLIPAudioCfg,
+            text_cfg: CLIPTextCfg,
+            quick_gelu: bool = False,
+            init_logit_scale: float = np.log(1 / 0.07),
+            init_logit_bias: Optional[float] = None,
+            cast_dtype: Optional[torch.dtype] = None,
+            output_dict: bool = False,
+    ):
+        super().__init__()
+        self.output_dict = output_dict
+
+        if not quick_gelu:
+            mlp_act_layer = nn.ReLU()
+        else:
+            mlp_act_layer = nn.GELU()
+
+        # text_cfg["act_layer"] = mlp_act_layer
+        text_cfg["audio"] = True
+
+        self.audio = _build_audio_tower(embed_dim, audio_cfg, quick_gelu, cast_dtype)
+        self.visual = self.audio
+        text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype, audio=True)
+        self.text = text
+        self.is_hf = text_cfg.get("hf_model_name", None)
+        self.transformer = text.transformer
+        self.context_length = text.context_length
+        self.vocab_size = text.vocab_size
+        if not self.is_hf:
+            self.token_embedding = text.token_embedding
+            self.positional_embedding = text.positional_embedding
+            self.ln_final = text.ln_final
+            self.text_projection = text.text_projection
+            self.text_pool_type = text.pool_type
+            self.register_buffer('attn_mask', text.attn_mask, persistent=False)
+        else:
+            self.text_projection = text.proj
+            self.text_pool_type = text_cfg["hf_pooler_type"]
+        
+
+        self.logit_scale = nn.Parameter(torch.ones([]) * init_logit_scale)
+        if init_logit_bias is not None:
+            self.logit_bias = nn.Parameter(torch.ones([]) * init_logit_bias)
+        else:
+            self.logit_bias = None
+
+        joint_embed_shape = embed_dim
+
+        self.audio_projection = nn.Sequential(
+                nn.Linear(embed_dim, joint_embed_shape),
+                mlp_act_layer,
+                nn.Linear(joint_embed_shape, joint_embed_shape)
+            )
+
+    def lock_audio_tower(self, unlocked_groups=0, freeze_bn_stats=False):
+        # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
+        self.audio.lock(unlocked_groups=unlocked_groups, freeze_bn_stats=freeze_bn_stats)
+
+    @torch.jit.ignore
+    def set_grad_checkpointing(self, enable=True):
+        self.audio.set_grad_checkpointing(enable)
+        self.transformer.grad_checkpointing = enable
+
+    def encode_audio(self, audio, normalize: bool = False):
+        features = self.audio(audio)
+        # for k in features.keys():
+        #     print(k, features[k].shape)
+        features = features["embedding"]
+        return F.normalize(features, dim=-1) if normalize else features
+
+    def encode_text(self, text, normalize: bool = False):
+        
+
+        if not self.is_hf:
+            cast_dtype = self.transformer.get_cast_dtype()
+
+            x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
+            x = x + self.positional_embedding.to(cast_dtype)
+            x = x.permute(1, 0, 2)  # NLD -> LND
+            x = self.transformer(x, attn_mask=self.attn_mask)
+            x = x.permute(1, 0, 2)  # LND -> NLD
+            x = self.ln_final(x)  # [batch_size, n_ctx, transformer.width]
+            x, _ = text_global_pool(x, text, self.text_pool_type)
+            if self.text_projection is not None:
+                if isinstance(self.text_projection, nn.Sequential) or isinstance(self.text_projection, nn.Linear):
+                    x = self.text_projection(x)
+                else:
+                    x = x @ self.text_projection
+        else:
+            x = self.text(text)
+        return F.normalize(x, dim=-1) if normalize else x
+
+    def get_logits(self, audio, text):
+        audio_features = self.encode_audio(audio, normalize=True)
+        text_features = self.encode_text(text, normalize=True)
+        audio_logits = self.logit_scale.exp() * audio_features @ text_features.T
+        if self.logit_bias is not None:
+            audio_logits += self.logit_bias
+        text_logits = audio_logits.T
+        return audio_logits, text_logits
+
+    def forward(
+            self,
+            audio: Optional[torch.Tensor] = None,
+            text: Optional[torch.Tensor] = None,
+    ):
+
+        audio_features = self.encode_audio(audio, normalize=True) if audio is not None else None
+        text_features = self.encode_text(text, normalize=True) if text is not None else None
+
+        if audio is not None:
+            audio_features = self.audio_projection(audio_features)
+
+        if self.output_dict:
+            out_dict = {
+                "audio_features": audio_features,
+                "text_features": text_features,
+                "logit_scale": self.logit_scale.exp()
+            }
+            if self.logit_bias is not None:
+                out_dict['logit_bias'] = self.logit_bias
+            return out_dict
+
+        if self.logit_bias is not None:
+            return audio_features, text_features, self.logit_scale.exp(), self.logit_bias
+        return audio_features, text_features, self.logit_scale.exp()
 
 class CLIP(nn.Module):
     output_dict: torch.jit.Final[bool]

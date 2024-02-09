@@ -583,6 +583,7 @@ class TextTransformer(nn.Module):
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = LayerNorm,
             output_tokens: bool = False,
+            audio: bool = False
     ):
         super().__init__()
         assert pool_type in ('first', 'last', 'argmax', 'none')
@@ -620,10 +621,16 @@ class TextTransformer(nn.Module):
 
         if proj_bias:
             self.text_projection = nn.Linear(width, output_dim)
+        elif audio:
+            self.text_projection = nn.Sequential(
+                nn.Linear(width, output_dim),
+                nn.GELU(),
+                nn.Linear(output_dim, output_dim)
+            )
         else:
             self.text_projection = nn.Parameter(torch.empty(width, output_dim))
 
-        self.init_parameters()
+            self.init_parameters()
 
     def init_parameters(self):
         nn.init.normal_(self.token_embedding.weight, std=0.02)
