@@ -23,7 +23,6 @@ from .transformer import LayerNormFp32, LayerNorm, QuickGELU, Attention, VisionT
 from .utils import to_2tuple
 from .htsat import create_htsat_model
 
-
 @dataclass
 class CLIPAudioCfg:
     model_type: str = "HTSAT"
@@ -99,6 +98,7 @@ class CLIPTextCfg:
     hf_proj_type: str = 'mlp'
     hf_pooler_type: str = 'mean_pooler'  # attentional pooling for HF models
     audio: bool = False
+    clip_tower: bool = False
 
 
 def get_cast_dtype(precision: str):
@@ -220,6 +220,7 @@ def _build_text_tower(
         text_cfg = CLIPTextCfg(**text_cfg)
 
     if text_cfg.hf_model_name:
+
         text = HFTextEncoder(
             text_cfg.hf_model_name,
             output_dim=embed_dim,
@@ -227,7 +228,10 @@ def _build_text_tower(
             pooler_type=text_cfg.hf_pooler_type,
             pretrained=text_cfg.hf_model_pretrained,
             output_tokens=text_cfg.output_tokens,
+            clip_text_tower=text_cfg.clip_tower,
         )
+ 
+
     else:
         act_layer = QuickGELU if quick_gelu else nn.GELU
         norm_layer = LayerNormFp32 if cast_dtype in (torch.float16, torch.bfloat16) else LayerNorm
@@ -286,6 +290,7 @@ class CLAP(nn.Module):
         self.visual = self.audio
         text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype, audio=True)
         self.text = text
+        print(self.text)
         self.is_hf = text_cfg.get("hf_model_name", None)
         self.transformer = text.transformer
         self.context_length = text.context_length

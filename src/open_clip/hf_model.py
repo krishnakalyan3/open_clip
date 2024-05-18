@@ -106,6 +106,7 @@ class HFTextEncoder(nn.Module):
             proj_type: str = None,
             pretrained: bool = True,
             output_tokens: bool = False,
+            clip_text_tower: bool = False,
     ):
         super().__init__()
         self.output_tokens = output_tokens
@@ -120,8 +121,16 @@ class HFTextEncoder(nn.Module):
             self.config = AutoConfig.from_pretrained(model_name_or_path)
             create_func, model_args = (AutoModel.from_pretrained, model_name_or_path) if pretrained else (
                 AutoModel.from_config, self.config)
+
+            if clip_text_tower:
+                clip_model = create_func(model_args)
+                print("Using CLIP text model")
+                print(clip_model)
+                self.config = self.config.text_config
+                self.transformer = clip_model.text_model
+                del clip_model # free up memory
             # TODO: do all model configs have this attribute? PretrainedConfig does so yes??
-            if hasattr(self.config, "is_encoder_decoder") and self.config.is_encoder_decoder:
+            elif hasattr(self.config, "is_encoder_decoder") and self.config.is_encoder_decoder:
                 self.transformer = create_func(model_args)
                 self.transformer = self.transformer.encoder
             else:
@@ -131,6 +140,7 @@ class HFTextEncoder(nn.Module):
             self.transformer = AutoModel.from_config(config)
         if pooler_type is None:  # get default arch pooler
             pooler_type = (arch_dict[self.config.model_type]["pooler"])
+        
 
         # FIXME downstream users of OpenCLIP models use these attr, need to verify valid across all models
         self.vocab_size = getattr(self.config, 'vocab_size', 0)

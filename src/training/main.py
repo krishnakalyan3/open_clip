@@ -222,6 +222,8 @@ def main(args):
         model_kwargs['init_logit_bias'] = -10
     if args.pretrained_audio:
         model_kwargs["pretrained_audio"] = args.pretrained_audio
+    if args.pretrained_text:
+        model_kwargs["pretrained_text_path"] = args.pretrained_text
     logging.info(args.pretrained_audio)
     model, preprocess_train, preprocess_val = create_model_and_transforms(
         args.model,

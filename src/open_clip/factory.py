@@ -182,6 +182,7 @@ def create_model(
         output_dict: Optional[bool] = None,
         require_pretrained: bool = False,
         pretrained_audio: bool = False,
+        pretrained_text_path: Optional[str] = None,
         **model_kwargs,
 ):
     force_preprocess_cfg = force_preprocess_cfg or {}
@@ -191,6 +192,8 @@ def create_model(
     
     if model_name.startswith("HTSAT"):
         model_cfg = get_model_config(model_name)
+        if pretrained_text_path:
+            model_cfg["text_cfg"].update({"hf_model_name": pretrained_text_path})
         model = CLAP(**model_cfg, cast_dtype=cast_dtype)
         setattr(model, "model_cfg", model_cfg)
 

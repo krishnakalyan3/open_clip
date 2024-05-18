@@ -64,4 +64,16 @@ arch_dict = {
         },
         "pooler": "cls_pooler",
     },
+    "clip_text_model": {
+        "config_names": {
+            "context_length": "max_position_embeddings",
+            "vocab_size": "vocab_size",
+            "width": "hidden_size",
+            "heads": "num_attention_heads",
+            "layers": "num_hidden_layers",
+            "layer_attr": "transformer",
+            "token_embeddings_attr": "embeddings"
+        },
+        "pooler": "cls_pooler",
+    },
 }

@@ -66,6 +66,12 @@ def parse_args(args):
         help="Use a pretrained audio model weights for the audio encoder of CLAP",
     )
     parser.add_argument(
+        "--pretrained-text",
+        default=None,
+        type=str,
+        help="Use a pretrained text model weights for the text encoder of CLAP",
+    )
+    parser.add_argument(
         "--optimizer",
         type=str,
         default="adamw",
